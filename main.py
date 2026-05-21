@@ -2,17 +2,12 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import pandas as pd
 import xgboost as xgb
-import joblib
 
 app = FastAPI(title="Motor Predictivo Churn - XGBoost")
 
 # 1. Cargar el modelo al levantar el servicio
-# Si lo guardaste como .json (Recomendado):
 modelo = xgb.XGBClassifier()
 modelo.load_model("modelo_xgboost.json")
-
-# Si lo guardaste como .pkl con joblib, descomenta la siguiente línea:
-# modelo = joblib.load("modelo_xgboost.pkl")
 
 # 2. Definir el esquema del DTO que envía tu backend en .NET Core
 class ClienteDTO(BaseModel):
@@ -20,8 +15,8 @@ class ClienteDTO(BaseModel):
     prima_bruta_anual: float
     meses_vigencia: int
     ano: int
-    medio_pago: str  # Ej: "PAT (debito cuenta vista)"
-    deducible: str   # Ej: "UF 10"
+    medio_pago: str  
+    deducible: str   
 
 @app.post("/api/predict")
 def predict_churn(cliente: ClienteDTO):
@@ -61,8 +56,7 @@ def predict_churn(cliente: ClienteDTO):
     # Convertir a DataFrame manteniendo estrictamente el orden de las 19 columnas
     columnas_ordenadas = list(datos_cliente.keys())
     df_usuario = pd.DataFrame([datos_cliente], columns=columnas_ordenadas)
-    
-    # Ejecutar la inferencia (XGBoost exige que la matriz sea estrictamente numérica float)
+        
     probabilidad_fuga = modelo.predict_proba(df_usuario)[0][1] # Probabilidad de la clase 1
     
     # Retornar la respuesta estructurada a .NET Core
