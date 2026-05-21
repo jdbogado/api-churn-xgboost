@@ -3,3 +3,4 @@ uvicorn
 xgboost
 pandas
 pydantic
+scikit-learn
