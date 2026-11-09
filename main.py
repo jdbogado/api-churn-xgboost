@@ -1,25 +1,55 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import pandas as pd
+from pathlib import Path
+from typing import List
+
+import numpy as np
 import xgboost as xgb
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Motor Predictivo Churn - XGBoost")
 
-# 1. Cargar el modelo al levantar el servicio
+# 1. Cargar el modelo una sola vez al levantar el servicio.
+#    Ruta absoluta: funciona aunque uvicorn se lance desde otra carpeta.
+RUTA_MODELO = Path(__file__).resolve().parent / "modelo_xgboost.json"
 modelo = xgb.XGBClassifier()
-modelo.load_model("modelo_xgboost.json")
+modelo.load_model(RUTA_MODELO)
 
-# 2. Definir el esquema del DTO
+# 2. El orden de las columnas se toma del propio modelo, no de una lista escrita a mano:
+#    si se reentrena con otras columnas, la API no se desincroniza en silencio.
+COLUMNAS = modelo.get_booster().feature_names
+INDICE_COLUMNA = {nombre: i for i, nombre in enumerate(COLUMNAS)}
+
+COL_CUOTAS = "Nro. Cuotas vencidas"
+COL_PRIMA = "Prima Bruta Anual"
+COL_MESES = "Meses Vigencia"
+COL_ANO = "Año"
+PREFIJO_MEDIO_PAGO = "Medio de Pago_"
+PREFIJO_DEDUCIBLE = "Deducible_"
+
+_faltantes = [c for c in (COL_CUOTAS, COL_PRIMA, COL_MESES, COL_ANO) if c not in INDICE_COLUMNA]
+if _faltantes:
+    raise RuntimeError(f"El modelo no contiene las columnas esperadas: {_faltantes}")
+
+UMBRAL_RIESGO = 0.5
+MAX_CLIENTES_POR_LOTE = 1000
+
+
+# 3. Esquemas de entrada/salida
 class ClienteDTO(BaseModel):
     nro_cuotas_vencidas: int
     prima_bruta_anual: float
     meses_vigencia: int
     ano: int
-    medio_pago: str  
-    deducible: str   
-    plan: str # <-- NUEVO: Previene Error 422 desde .NET Core
+    medio_pago: str
+    deducible: str
+    plan: str  # El modelo no lo usa; solo alimenta el mensaje explicativo.
 
-# 3. Función de explicabilidad usando reglas clásicas de negocio
+
+class LoteClientesDTO(BaseModel):
+    clientes: List[ClienteDTO] = Field(..., min_length=1, max_length=MAX_CLIENTES_POR_LOTE)
+
+
+# 4. Función de explicabilidad usando reglas clásicas de negocio
 def generar_mensaje_xai(cliente: ClienteDTO, prob: float):
     mensaje_1 = ""
     mensaje_2 = ""
@@ -49,54 +79,51 @@ def generar_mensaje_xai(cliente: ClienteDTO, prob: float):
     return mensaje_1 + " " + mensaje_2
 
 
+# 5. Conversión cliente -> vector numérico en el orden exacto del modelo
+def vectorizar(cliente: ClienteDTO) -> np.ndarray:
+    fila = np.zeros(len(COLUMNAS), dtype=np.float32)
+    fila[INDICE_COLUMNA[COL_CUOTAS]] = cliente.nro_cuotas_vencidas
+    fila[INDICE_COLUMNA[COL_PRIMA]] = cliente.prima_bruta_anual
+    fila[INDICE_COLUMNA[COL_MESES]] = cliente.meses_vigencia
+    fila[INDICE_COLUMNA[COL_ANO]] = cliente.ano
+
+    # One-hot: si la categoría no existe en el modelo queda en la categoría base (todo 0),
+    # igual que en el entrenamiento con drop_first.
+    for columna in (PREFIJO_MEDIO_PAGO + cliente.medio_pago, PREFIJO_DEDUCIBLE + cliente.deducible):
+        indice = INDICE_COLUMNA.get(columna)
+        if indice is not None:
+            fila[indice] = 1.0
+    return fila
+
+
+def construir_respuesta(cliente: ClienteDTO, probabilidad: float) -> dict:
+    return {
+        "probabilidad_churn": round(probabilidad, 4),
+        "riesgo_detectado": probabilidad > UMBRAL_RIESGO,
+        "factores_clave": [generar_mensaje_xai(cliente, probabilidad)],
+    }
+
+
+def predecir(clientes: List[ClienteDTO]) -> List[dict]:
+    # Una sola llamada al modelo para todo el lote (XGBoost vectoriza internamente).
+    matriz = np.vstack([vectorizar(c) for c in clientes])
+    probabilidades = modelo.predict_proba(matriz)[:, 1]
+    return [construir_respuesta(c, float(p)) for c, p in zip(clientes, probabilidades)]
+
+
+# 6. Endpoints
+@app.get("/health")
+def health():
+    """Liviano: sirve para 'despertar' el servicio en Render sin ejecutar el modelo."""
+    return {"estado": "ok"}
+
+
 @app.post("/api/predict")
 def predict_churn(cliente: ClienteDTO):
-    # Crear un diccionario base con ceros para las 19 variables originales
-    # Nota: No agregamos 'plan' al DataFrame porque el modelo actual no fue entrenado con él.
-    datos_cliente = {
-        'Nro. Cuotas vencidas': float(cliente.nro_cuotas_vencidas),
-        'Prima Bruta Anual': float(cliente.prima_bruta_anual),
-        'Meses Vigencia': float(cliente.meses_vigencia),
-        'Año': float(cliente.ano),
-        'Medio de Pago_PAT (debito cuenta corriente)': 0.0,
-        'Medio de Pago_PAT (debito cuenta vista)': 0.0,
-        'Deducible_Pendiente': 0.0,
-        'Deducible_S/D': 0.0,
-        'Deducible_UF 10': 0.0,
-        'Deducible_UF 15': 0.0,
-        'Deducible_UF 2.500': 0.0,
-        'Deducible_UF 20': 0.0,
-        'Deducible_UF 25': 0.0,
-        'Deducible_UF 3': 0.0,
-        'Deducible_UF 30': 0.0,
-        'Deducible_UF 5': 0.0,
-        'Deducible_UF 5.000': 0.0,
-        'Deducible_UF 50': 0.0,
-        'Deducible_UF 60': 0.0
-    }
-    
-    # Activar la bandera (1.0) para el medio de pago recibido
-    col_medio_pago = f"Medio de Pago_{cliente.medio_pago}"
-    if col_medio_pago in datos_cliente:
-        datos_cliente[col_medio_pago] = 1.0
-        
-    # Activar la bandera (1.0) para el deducible recibido
-    col_deducible = f"Deducible_{cliente.deducible}"
-    if col_deducible in datos_cliente:
-        datos_cliente[col_deducible] = 1.0
+    return predecir([cliente])[0]
 
-    # Convertir a DataFrame manteniendo estrictamente el orden de las 19 columnas
-    columnas_ordenadas = list(datos_cliente.keys())
-    df_usuario = pd.DataFrame([datos_cliente], columns=columnas_ordenadas)
-        
-    probabilidad_fuga = modelo.predict_proba(df_usuario)[0][1] # Probabilidad de la clase 1
-    
-    # Evaluar los datos reales ingresados usando la estructura clásica IF
-    mensaje_final = generar_mensaje_xai(cliente, probabilidad_fuga)
-    
-    # Retornar la respuesta estructurada a .NET Core
-    return {
-        "probabilidad_churn": round(float(probabilidad_fuga), 4),
-        "riesgo_detectado": bool(probabilidad_fuga > 0.5),
-        "factores_clave": [mensaje_final]
-    }
+
+@app.post("/api/predict/batch")
+def predict_churn_batch(lote: LoteClientesDTO):
+    """Evalúa varios clientes en una sola petición. Los resultados vienen en el mismo orden."""
+    return {"resultados": predecir(lote.clientes)}
